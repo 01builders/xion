@@ -9,8 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/strangelove-ventures/interchaintest/v7/ibc"
+	"cosmossdk.io/math"
 
+	"github.com/strangelove-ventures/interchaintest/v8/ibc"
+
+	"cosmossdk.io/x/feegrant"
 	wasmtypes "github.com/CosmWasm/wasmd/x/wasm/types"
 	xionapp "github.com/burnt-labs/xion/app"
 	jwktypes "github.com/burnt-labs/xion/x/jwk/types"
@@ -22,25 +25,29 @@ import (
 	"github.com/cosmos/cosmos-sdk/x/authz"
 	authztypes "github.com/cosmos/cosmos-sdk/x/authz"
 	banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
-	"github.com/cosmos/cosmos-sdk/x/feegrant"
-	feegranttypes "github.com/cosmos/cosmos-sdk/x/feegrant"
 	"github.com/cosmos/gogoproto/proto"
 	aatypes "github.com/larry0x/abstract-account/x/abstractaccount/types"
-	ibctest "github.com/strangelove-ventures/interchaintest/v7"
-	"github.com/strangelove-ventures/interchaintest/v7/testutil"
+	ibctest "github.com/strangelove-ventures/interchaintest/v8"
+	"github.com/strangelove-ventures/interchaintest/v8/testutil"
 	"github.com/stretchr/testify/require"
 )
 
 type GrantConfig struct {
 	Description   string                 `json:"description"`
 	Authorization map[string]interface{} `json:"authorization"`
-	Allowance     *ExplicitAny           `json:"allowance"`
+	Optional      bool                   `json:"optional"`
 }
 
+type FeeConfig struct {
+	Description string       `json:"description"`
+	Allowance   *ExplicitAny `json:"allowance,omitempty"`
+	Expiration  int32        `json:"expiration,omitempty"`
+}
 type TreasuryInstantiateMsg struct {
-	Admin        types.AccAddress `json:"admin"`
+	Admin        types.AccAddress `json:"admin,omitempty"`
 	TypeUrls     []string         `json:"type_urls"`
 	GrantConfigs []GrantConfig    `json:"grant_configs"`
+	FeeConfig    *FeeConfig       `json:"fee_config"`
 }
 
 type ExplicitAny struct {
@@ -62,7 +69,7 @@ func TestTreasuryContract(t *testing.T) {
 
 	// Create and Fund User Wallets
 	t.Log("creating and funding user accounts")
-	fundAmount := int64(10_000_000)
+	fundAmount := math.NewInt(10_000_000)
 	users := ibctest.GetAndFundTestUsers(t, ctx, "default", fundAmount, xion)
 	xionUser := users[0]
 	err := testutil.WaitForBlocks(ctx, 2, xion)
@@ -91,8 +98,8 @@ func TestTreasuryContract(t *testing.T) {
 
 	xion.Config().EncodingConfig.InterfaceRegistry.RegisterInterface(
 		"cosmos.feegrant.v1beta1.FeeAllowanceI",
-		(*feegranttypes.FeeAllowanceI)(nil),
-		&feegranttypes.BasicAllowance{},
+		(*feegrant.FeeAllowanceI)(nil),
+		&feegrant.BasicAllowance{},
 	)
 
 	xion.Config().EncodingConfig.InterfaceRegistry.RegisterInterface(
@@ -122,7 +129,6 @@ func TestTreasuryContract(t *testing.T) {
 	}
 	feeGrant, err := feegrant.NewGrant(xionUserAddr, xionUserAddr, &testAllowance)
 	require.NoError(t, err)
-
 	allowanceAny := ExplicitAny{
 		TypeURL: feeGrant.Allowance.TypeUrl,
 		Value:   feeGrant.Allowance.Value,
@@ -135,12 +141,17 @@ func TestTreasuryContract(t *testing.T) {
 	grantConfig := GrantConfig{
 		Description:   "test authorization",
 		Authorization: authorizationAny,
-		Allowance:     &allowanceAny,
+		Optional:      false,
 	}
 
 	instantiateMsg := TreasuryInstantiateMsg{
 		TypeUrls:     []string{testAuth.MsgTypeURL()},
 		GrantConfigs: []GrantConfig{grantConfig},
+		FeeConfig: &FeeConfig{
+			Description: "test fee grant",
+			Allowance:   &allowanceAny,
+			Expiration:  int32(18000),
+		},
 	}
 
 	instantiateMsgStr, err := json.Marshal(instantiateMsg)
@@ -151,7 +162,7 @@ func TestTreasuryContract(t *testing.T) {
 	t.Logf("created treasury instance: %s", treasuryAddr)
 	err = testutil.WaitForBlocks(ctx, 2, xion)
 	require.NoError(t, err)
-	contractState, err := ExecQuery(t, ctx, xion.FullNodes[0], "wasm", "contract-state", "all", treasuryAddr)
+	contractState, err := ExecQuery(t, ctx, xion.GetNode(), "wasm", "contract-state", "all", treasuryAddr)
 	require.NoError(t, err)
 	t.Logf("Contract State: %s", contractState)
 
@@ -170,19 +181,18 @@ func TestTreasuryContract(t *testing.T) {
 	err = xion.SendFunds(ctx, granterUser.KeyName(), ibc.WalletAmount{
 		Address: treasuryAddr,
 		Denom:   "uxion",
-		Amount:  1000,
+		Amount:  math.NewInt(1000),
 	})
 	require.NoError(t, err)
 
 	authzGrantMsg, err := authz.NewMsgGrant(granterUser.Address(), granteeUser.Address(), testAuth, &inFive)
 	require.NoError(t, err)
-	encodingConfig := xionapp.MakeEncodingConfig()
+	encodingConfig := xionapp.MakeEncodingConfig(t)
 
 	executeMsg := map[string]interface{}{}
 	feegrantMsg := map[string]interface{}{}
 	feegrantMsg["authz_granter"] = granterUser.FormattedAddress()
 	feegrantMsg["authz_grantee"] = granteeUser.FormattedAddress()
-	feegrantMsg["msg_type_url"] = testAuth.MsgTypeURL()
 	executeMsg["deploy_fee_grant"] = feegrantMsg
 	executeMsgBz, err := json.Marshal(executeMsg)
 	require.NoError(t, err)
@@ -213,37 +223,37 @@ func TestTreasuryContract(t *testing.T) {
 
 	_, err = sendFile.Write([]byte(txJSONStr))
 	require.NoError(t, err)
-	err = UploadFileToContainer(t, ctx, xion.FullNodes[0], sendFile)
+	err = UploadFileToContainer(t, ctx, xion.GetNode(), sendFile)
 	require.NoError(t, err)
 
 	sendFilePath := strings.Split(sendFile.Name(), "/")
 
-	signedTx, err := ExecBinRaw(t, ctx, xion.FullNodes[0],
-		"tx", "sign", path.Join(xion.FullNodes[0].HomeDir(), sendFilePath[len(sendFilePath)-1]),
+	signedTx, err := ExecBinRaw(t, ctx, xion.GetNode(),
+		"tx", "sign", path.Join(xion.GetNode().HomeDir(), sendFilePath[len(sendFilePath)-1]),
 		"--from", granterUser.KeyName(),
 		"--chain-id", xion.Config().ChainID,
 		"--keyring-backend", keyring.BackendTest,
 		"--output", "json",
 		"--overwrite",
 		"-y",
-		"--node", fmt.Sprintf("tcp://%s:26657", xion.FullNodes[0].HostName()))
+		"--node", fmt.Sprintf("tcp://%s:26657", xion.GetNode().HostName()))
 	require.NoError(t, err)
 	t.Logf("signed tx: %s", signedTx)
 
 	// todo: validate that the feegrant was created correctly
-	res, err := ExecBroadcastWithFlags(t, ctx, xion.FullNodes[0], signedTx, "--output", "json")
+	res, err := ExecBroadcastWithFlags(t, ctx, xion.GetNode(), signedTx, "--output", "json")
 
 	require.NoError(t, err)
 	t.Logf("broadcasted tx: %s", res)
 
-	txDetails, err := ExecQuery(t, ctx, xion.FullNodes[0], "tx", res)
+	txDetails, err := ExecQuery(t, ctx, xion.GetNode(), "tx", res)
 	require.NoError(t, err)
 	t.Logf("TxDetails: %s", txDetails)
 
 	err = testutil.WaitForBlocks(ctx, 2, xion)
 	require.NoError(t, err)
 
-	feeGrantDetails, err := ExecQuery(t, ctx, xion.FullNodes[0], "feegrant", "grants-by-grantee", granteeUser.FormattedAddress())
+	feeGrantDetails, err := ExecQuery(t, ctx, xion.GetNode(), "feegrant", "grants-by-grantee", granteeUser.FormattedAddress())
 	require.NoError(t, err)
 	t.Logf("FeeGrantDetails: %s", feeGrantDetails)
 	allowances := feeGrantDetails["allowances"].([]interface{})

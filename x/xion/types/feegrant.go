@@ -1,6 +1,7 @@
 package types
 
 import (
+	"context"
 	"time"
 
 	wasmtypes "github.com/CosmWasm/wasmd/x/wasm/types"
@@ -8,12 +9,12 @@ import (
 	"github.com/cosmos/gogoproto/proto"
 
 	errorsmod "cosmossdk.io/errors"
+	"cosmossdk.io/x/feegrant"
 
 	"github.com/cosmos/cosmos-sdk/codec/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 	sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
 	"github.com/cosmos/cosmos-sdk/x/authz"
-	"github.com/cosmos/cosmos-sdk/x/feegrant"
 )
 
 // TODO: Revisit this once we have proper gas fee framework.
@@ -25,8 +26,10 @@ const (
 var (
 	_ feegrant.FeeAllowanceI        = (*AuthzAllowance)(nil)
 	_ feegrant.FeeAllowanceI        = (*ContractsAllowance)(nil)
+	_ feegrant.FeeAllowanceI        = (*MultiAnyAllowance)(nil)
 	_ types.UnpackInterfacesMessage = (*AuthzAllowance)(nil)
 	_ types.UnpackInterfacesMessage = (*ContractsAllowance)(nil)
+	_ types.UnpackInterfacesMessage = (*MultiAnyAllowance)(nil)
 )
 
 // UnpackInterfaces implements UnpackInterfacesMessage.UnpackInterfaces
@@ -72,7 +75,7 @@ func (a *AuthzAllowance) SetAllowance(allowance feegrant.FeeAllowanceI) error {
 	return nil
 }
 
-func (a *AuthzAllowance) Accept(ctx sdk.Context, fee sdk.Coins, msgs []sdk.Msg) (bool, error) {
+func (a *AuthzAllowance) Accept(ctx context.Context, fee sdk.Coins, msgs []sdk.Msg) (bool, error) {
 	subMsgs, ok := a.allMsgTypesAuthz(ctx, msgs)
 	if !ok {
 		return false, errorsmod.Wrap(feegrant.ErrMessageNotAllowed, "messages are not authz")
@@ -92,11 +95,12 @@ func (a *AuthzAllowance) Accept(ctx sdk.Context, fee sdk.Coins, msgs []sdk.Msg) 
 	return remove, err
 }
 
-func (a *AuthzAllowance) allMsgTypesAuthz(ctx sdk.Context, msgs []sdk.Msg) ([]sdk.Msg, bool) {
+func (a *AuthzAllowance) allMsgTypesAuthz(ctx context.Context, msgs []sdk.Msg) ([]sdk.Msg, bool) {
 	var subMsgs []sdk.Msg
 
 	for _, msg := range msgs {
-		ctx.GasMeter().ConsumeGas(gasCostPerIteration, "check msg")
+		sdkCtx := sdk.UnwrapSDKContext(ctx)
+		sdkCtx.GasMeter().ConsumeGas(gasCostPerIteration, "check msg")
 
 		authzMsg, ok := msg.(*authz.MsgExec)
 		if !ok {
@@ -189,7 +193,7 @@ func (a *ContractsAllowance) SetAllowance(allowance feegrant.FeeAllowanceI) erro
 	return nil
 }
 
-func (a *ContractsAllowance) Accept(ctx sdk.Context, fee sdk.Coins, msgs []sdk.Msg) (bool, error) {
+func (a *ContractsAllowance) Accept(ctx context.Context, fee sdk.Coins, msgs []sdk.Msg) (bool, error) {
 	if !a.allMsgsValidWasmExecs(ctx, msgs) {
 		return false, errorsmod.Wrap(feegrant.ErrMessageNotAllowed, "messages are not for specific contracts")
 	}
@@ -218,11 +222,12 @@ func (a *ContractsAllowance) allowedContractsToMap(ctx sdk.Context) map[string]b
 	return addrsMap
 }
 
-func (a *ContractsAllowance) allMsgsValidWasmExecs(ctx sdk.Context, msgs []sdk.Msg) bool {
-	addrsMap := a.allowedContractsToMap(ctx)
+func (a *ContractsAllowance) allMsgsValidWasmExecs(ctx context.Context, msgs []sdk.Msg) bool {
+	sdkCtx := sdk.UnwrapSDKContext(ctx)
+	addrsMap := a.allowedContractsToMap(sdkCtx)
 
 	for _, msg := range msgs {
-		ctx.GasMeter().ConsumeGas(gasCostPerIteration, "check msg")
+		sdkCtx.GasMeter().ConsumeGas(gasCostPerIteration, "check msg")
 
 		wasmMsg, ok := msg.(*wasmtypes.MsgExecuteContract)
 		if !ok {
@@ -265,4 +270,142 @@ func (a *ContractsAllowance) ExpiresAt() (*time.Time, error) {
 		return nil, err
 	}
 	return allowance.ExpiresAt()
+}
+
+// UnpackInterfaces implements UnpackInterfacesMessage.UnpackInterfaces
+func (a *MultiAnyAllowance) UnpackInterfaces(unpacker types.AnyUnpacker) error {
+	var allowance feegrant.FeeAllowanceI
+	for _, innerAllowance := range a.Allowances {
+		if err := unpacker.UnpackAny(innerAllowance, &allowance); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func NewMultiAnyAllowance(allowances []feegrant.FeeAllowanceI) (*MultiAnyAllowance, error) {
+	var anyAllowances []*types.Any
+	for _, allowance := range allowances {
+		msg, ok := allowance.(proto.Message)
+		if !ok {
+			return nil, errorsmod.Wrapf(sdkerrors.ErrPackAny, "cannot proto marshal %T", msg)
+		}
+		anyAllowance, err := types.NewAnyWithValue(msg)
+		if err != nil {
+			return nil, err
+		}
+		anyAllowances = append(anyAllowances, anyAllowance)
+	}
+
+	return &MultiAnyAllowance{
+		Allowances: anyAllowances,
+	}, nil
+}
+
+// GetAllowance returns allowed fee allowance.
+func (a *MultiAnyAllowance) GetAllowance(index int) (feegrant.FeeAllowanceI, error) {
+	allowance, ok := a.Allowances[index].GetCachedValue().(feegrant.FeeAllowanceI)
+	if !ok {
+		return nil, errorsmod.Wrap(feegrant.ErrNoAllowance, "failed to get allowance")
+	}
+
+	return allowance, nil
+}
+
+// SetAllowance sets allowed fee allowance.
+func (a *MultiAnyAllowance) SetAllowance(index int, allowance feegrant.FeeAllowanceI) error {
+	var err error
+	a.Allowances[index], err = types.NewAnyWithValue(allowance.(proto.Message))
+	if err != nil {
+		return errorsmod.Wrapf(sdkerrors.ErrPackAny, "cannot proto marshal %T", allowance)
+	}
+
+	return nil
+}
+
+func (a *MultiAnyAllowance) Accept(ctx context.Context, fee sdk.Coins, msgs []sdk.Msg) (bool, error) {
+	// accept and charge first allowance that doesn't error
+	accepted := false
+	for i := range a.Allowances {
+		sdk.UnwrapSDKContext(ctx).GasMeter().ConsumeGas(gasCostPerIteration, "check allowance")
+		allowance, err := a.GetAllowance(i)
+		if err != nil {
+			return false, err
+		}
+
+		remove, err := allowance.Accept(ctx, fee, msgs)
+		if err != nil {
+			// the allowance errored, try the next
+			continue
+		}
+		// the allowance was accepted
+		accepted = true
+
+		if !remove {
+			// update the allowance state
+			if err = a.SetAllowance(i, allowance); err != nil {
+				return false, err
+			}
+		} else {
+			// if the allowance is complete, remove it from the allowed list
+			a.Allowances = append(a.Allowances[:i], a.Allowances[i+1:]...)
+		}
+		break
+	}
+
+	// if no allowances accepted, the allowance doesn't accept
+	if !accepted {
+		return false, errorsmod.Wrapf(ErrNoValidAllowances, "all allowances errored")
+	}
+
+	// if all the allowances have been removed, remove this allowance as well
+	return len(a.Allowances) == 0, nil
+}
+
+func (a *MultiAnyAllowance) ValidateBasic() error {
+	if len(a.Allowances) == 0 {
+		return errorsmod.Wrap(feegrant.ErrNoAllowance, "allowance list should contain at least one")
+	}
+
+	for i := range a.Allowances {
+		allowance, err := a.GetAllowance(i)
+		if err != nil {
+			return err
+		}
+		if err := allowance.ValidateBasic(); err != nil {
+			return err
+		}
+	}
+
+	if _, err := a.ExpiresAt(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (a *MultiAnyAllowance) ExpiresAt() (*time.Time, error) {
+	// all allowances must expire at the same time
+	var expiration *time.Time
+	set := false
+	for i := range a.Allowances {
+		allowance, err := a.GetAllowance(i)
+		if err != nil {
+			return nil, err
+		}
+		newExpiration, err := allowance.ExpiresAt()
+		if err != nil {
+			return nil, err
+		}
+		if set {
+			if expiration != newExpiration {
+				return nil, errorsmod.Wrapf(ErrInconsistentExpiry, "allowance 0 had expiration %v while allowance %d had expiration %v", expiration, i, newExpiration)
+			}
+		} else {
+			set = true
+			expiration = newExpiration
+		}
+	}
+	return expiration, nil
 }

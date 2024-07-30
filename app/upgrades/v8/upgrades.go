@@ -1,7 +1,8 @@
-package v7
+package v8
 
 import (
 	"context"
+	"fmt"
 
 	upgradetypes "cosmossdk.io/x/upgrade/types"
 
@@ -22,7 +23,7 @@ func CreateUpgradeHandler(
 			return vm, err
 		}
 
-		sdkCtx.Logger().Info("Upgrade v7 complete")
+		sdkCtx.Logger().Info(fmt.Sprintf("Software Upgrade %s complete", UpgradeName))
 		return vm, err
 	}
 }
